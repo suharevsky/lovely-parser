@@ -24,7 +24,7 @@ function App() {
     const enhancedPrompt = prompt + "\n\ngive me json response metadata of the books like: title, author, publisher, pages, description, edition_year, isbn, libraccio_image_src,"
     //const enhancedPrompt = prompt;
     try {
-      const res = await fetch('http://localhost:3001/api/gemini', {
+      const res = await fetch('http://localhost:3001/api/openrouter', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -52,8 +52,8 @@ function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Gemini AI Assistant</h1>
-        <p>Enter your prompt below to generate content using Google's Gemini 1.5 Flash Lite model</p>
+        <h1>AI Assistant</h1>
+        <p>Enter your prompt below to generate content using Gemini 1.5 Flash 8B via OpenRouter</p>
       </header>
 
       <main className="main-content">

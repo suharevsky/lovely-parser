@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-app.post('/api/gemini', async (req, res) => {
+app.post('/api/openrouter', async (req, res) => {
   try {
     const { prompt } = req.body;
 
@@ -17,41 +17,43 @@ app.post('/api/gemini', async (req, res) => {
       return res.status(400).json({ error: 'Prompt is required' });
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
-      return res.status(500).json({ error: 'GEMINI_API_KEY not configured' });
+      return res.status(500).json({ error: 'OPENROUTER_API_KEY not configured' });
     }
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-8b:generateContent?key=${apiKey}`,
+      'https://openrouter.ai/api/v1/chat/completions',
       {
-        contents: [{
-          parts: [{
-            text: prompt
-          }]
+        model: 'google/gemini-flash-1.5-8b',
+        messages: [{
+          role: 'user',
+          content: prompt
         }]
       },
       {
         headers: {
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+          'HTTP-Referer': 'http://localhost:3001'
         }
       }
     );
 
-    const generatedText = response.data.candidates[0].content.parts[0].text;
-    const tokenUsage = response.data.usageMetadata;
+    const generatedText = response.data.choices[0].message.content;
+    const tokenUsage = response.data.usage;
 
     res.json({
       response: generatedText,
       tokenUsage: tokenUsage ? {
-        promptTokens: tokenUsage.promptTokenCount,
-        responseTokens: tokenUsage.candidatesTokenCount,
-        totalTokens: tokenUsage.totalTokenCount
+        promptTokens: tokenUsage.prompt_tokens,
+        responseTokens: tokenUsage.completion_tokens,
+        totalTokens: tokenUsage.total_tokens
       } : null
     });
 
   } catch (error) {
-    console.error('Error calling Gemini API:', error.response?.data || error.message);
+    console.error('Error calling OpenRouter API:', error.response?.data || error.message);
     res.status(500).json({
       error: 'Failed to generate content',
       details: error.response?.data?.error?.message || error.message
