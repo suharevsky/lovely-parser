@@ -6,6 +6,9 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const createCsvWriter = require('csv-writer').createObjectCsvWriter;
+const { JSDOM } = require('jsdom');
+const multer = require('multer');
+const csvParser = require('csv-parser');
 require('dotenv').config();
 
 const app = express();
@@ -13,6 +16,21 @@ const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
+
+// Multer configuration for file uploads
+const upload = multer({
+  dest: 'uploads/',
+  limits: {
+    fileSize: 1024 * 1024 // 1MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only CSV files are allowed'), false);
+    }
+  }
+});
 
 // CSV configuration
 const CSV_FILE_PATH = path.join(__dirname, 'ai_responses.csv');
@@ -23,17 +41,34 @@ function generateResponseHash(isbn, aiResponse) {
   return crypto.createHash('md5').update(content).digest('hex');
 }
 
-// Helper function to check if record already exists
-async function checkRecordExists(hash) {
+// Helper function to check if ISBN already exists in CSV
+async function checkIsbnExists(isbn) {
   try {
     if (!fs.existsSync(CSV_FILE_PATH)) {
       return false;
     }
 
     const csvContent = fs.readFileSync(CSV_FILE_PATH, 'utf8');
-    return csvContent.includes(hash);
+    const lines = csvContent.split('\n');
+
+    // Skip header and empty lines
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line) {
+        // Parse CSV line and look for ISBN column
+        const columns = line.split(',');
+        // ISBN should be in the 6th column (index 5) based on: title,author,publisher,pages,edition_year,isbn,description
+        if (columns.length >= 6) {
+          const existingIsbn = columns[5].replace(/"/g, '').trim();
+          if (existingIsbn === isbn) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
   } catch (error) {
-    console.error('Error checking existing records:', error);
+    console.error('Error checking existing ISBN:', error);
     return false;
   }
 }
@@ -90,6 +125,348 @@ function csvFileNeedsHeaders() {
   const stats = fs.statSync(CSV_FILE_PATH);
   return stats.size === 0;  // File exists but is empty, needs headers
 }
+
+// Helper function to parse HTML and extract readable text (server-side version)
+function parseHtmlContent(htmlString) {
+  try {
+    // Create JSDOM instance to parse HTML
+    const dom = new JSDOM(htmlString);
+    const document = dom.window.document;
+
+    // Remove script and style elements
+    const scripts = document.querySelectorAll('script, style');
+    scripts.forEach(el => el.remove());
+
+    // Get text content and clean it up
+    let textContent = document.body.textContent || document.body.innerText || '';
+
+    // Clean up the text: remove extra whitespace, normalize line breaks
+    textContent = textContent
+      .replace(/\s+/g, ' ')  // Replace multiple spaces with single space
+      .replace(/\n\s*\n/g, '\n')  // Remove empty lines
+      .trim();
+
+    return textContent;
+  } catch (error) {
+    console.error('Error parsing HTML:', error);
+    return 'Error parsing HTML content';
+  }
+}
+
+// Helper function to parse CSV file and extract ISBNs
+function parseCSVFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const isbns = [];
+    const detectedColumns = [];
+    let headerProcessed = false;
+    let isbnColumnIndex = -1;
+
+    fs.createReadStream(filePath)
+      .pipe(csvParser())
+      .on('headers', (headers) => {
+        detectedColumns.push(...headers);
+
+        // Try to find ISBN column with flexible matching
+        const isbnPatterns = /^(isbn|isbn13|isbn10|book_isbn|bookisbn)$/i;
+        isbnColumnIndex = headers.findIndex(header => isbnPatterns.test(header.trim()));
+
+        // If no exact match, try partial matching
+        if (isbnColumnIndex === -1) {
+          isbnColumnIndex = headers.findIndex(header =>
+            header.toLowerCase().includes('isbn')
+          );
+        }
+
+        headerProcessed = true;
+      })
+      .on('data', (row) => {
+        if (!headerProcessed) return;
+
+        let isbn = '';
+
+        if (isbnColumnIndex >= 0) {
+          // Use detected ISBN column
+          const columnName = detectedColumns[isbnColumnIndex];
+          isbn = row[columnName];
+        } else {
+          // Try to find ISBN in any column by pattern matching
+          for (const [key, value] of Object.entries(row)) {
+            if (value && /^[0-9\-Xx]{10,17}$/.test(value.toString().trim())) {
+              isbn = value;
+              break;
+            }
+          }
+        }
+
+        if (isbn) {
+          const cleanIsbn = isbn.toString().trim();
+          if (cleanIsbn && /^[0-9\-Xx]{10,17}$/.test(cleanIsbn)) {
+            isbns.push(cleanIsbn);
+          }
+        }
+      })
+      .on('end', () => {
+        // Remove duplicates
+        const uniqueIsbns = [...new Set(isbns)];
+        resolve({
+          isbns: uniqueIsbns,
+          totalFound: uniqueIsbns.length,
+          detectedColumns,
+          isbnColumnDetected: isbnColumnIndex >= 0 ? detectedColumns[isbnColumnIndex] : null
+        });
+      })
+      .on('error', (error) => {
+        reject(error);
+      });
+  });
+}
+
+// Helper function to process full workflow for a single ISBN
+const processFullWorkflow = async (isbn) => {
+  const startTime = Date.now();
+  const result = {
+    isbn,
+    scrapeSuccess: false,
+    aiSuccess: false,
+    csvSuccess: false,
+    bookData: null,
+    csvDuplicate: false,
+    duration: 0,
+    error: null
+  };
+
+  try {
+    // Step 1: Scrape the ISBN
+    const scrapeResult = await scrapeSingleISBN(isbn);
+
+    if (!scrapeResult.success) {
+      result.error = scrapeResult.error;
+      result.duration = Date.now() - startTime;
+      return result;
+    }
+
+    result.scrapeSuccess = true;
+
+    // Step 2: Check if we have HTML content to process
+    if (!scrapeResult.data.found || !scrapeResult.data.html) {
+      result.error = 'No HTML content found for this ISBN';
+      result.duration = Date.now() - startTime;
+      return result;
+    }
+
+    // Step 3: Parse HTML content
+    const parsedText = parseHtmlContent(scrapeResult.data.html);
+
+    // Step 4: Create structured prompt for AI
+    const structuredPrompt = `Please analyze this book information from Libraccio and extract the metadata:
+
+${parsedText}
+
+Please provide a JSON response with the following book metadata:
+- title
+- author
+- publisher
+- pages
+- edition_year
+- isbn
+- description
+`;
+
+    // Step 5: Process with AI
+    try {
+      const apiKey = process.env.OPENROUTER_API_KEY;
+      if (!apiKey) {
+        result.error = 'OPENROUTER_API_KEY not configured';
+        result.duration = Date.now() - startTime;
+        return result;
+      }
+
+      const aiResponse = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model: 'google/gemini-flash-1.5-8b',
+          messages: [{
+            role: 'user',
+            content: structuredPrompt
+          }]
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'HTTP-Referer': 'http://localhost:3001'
+          }
+        }
+      );
+
+      const generatedText = aiResponse.data.choices[0].message.content;
+
+      // Parse the AI response
+      let parsedResponse;
+      try {
+        parsedResponse = JSON.parse(generatedText);
+      } catch (parseError) {
+        try {
+          const jsonMatch = generatedText.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/) ||
+                           generatedText.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const jsonString = jsonMatch[1] || jsonMatch[0];
+            parsedResponse = JSON.parse(jsonString);
+          } else {
+            throw new Error("No JSON found in response");
+          }
+        } catch (secondParseError) {
+          result.error = 'Failed to parse AI response as JSON';
+          result.duration = Date.now() - startTime;
+          return result;
+        }
+      }
+
+      result.aiSuccess = true;
+      result.bookData = parsedResponse;
+
+      // Step 6: Save to CSV
+      try {
+        // Check if ISBN already exists in CSV
+        const exists = await checkIsbnExists(isbn);
+        if (exists) {
+          result.csvSuccess = true;
+          result.csvDuplicate = true;
+        } else {
+          // Parse book data from AI response
+          const bookData = parseBookDataFromResponse(JSON.stringify(parsedResponse));
+
+          // Create dynamic headers based only on book data keys
+          const headers = Object.keys(bookData).map(key => ({
+            id: key,
+            title: key
+          }));
+
+          // Check if we need to write headers
+          const needsHeaders = csvFileNeedsHeaders();
+
+          // Create dynamic CSV writer and save
+          const csvWriter = createDynamicCsvWriter(headers, needsHeaders);
+          await csvWriter.writeRecords([bookData]);
+
+          result.csvSuccess = true;
+          result.csvDuplicate = false;
+        }
+      } catch (csvError) {
+        result.error = `CSV save failed: ${csvError.message}`;
+        result.duration = Date.now() - startTime;
+        return result;
+      }
+
+    } catch (aiError) {
+      result.error = `AI processing failed: ${aiError.response?.data?.error?.message || aiError.message}`;
+      result.duration = Date.now() - startTime;
+      return result;
+    }
+
+  } catch (error) {
+    result.error = `Workflow failed: ${error.message}`;
+  }
+
+  result.duration = Date.now() - startTime;
+  return result;
+};
+
+app.post('/api/upload-csv-workflow', upload.single('csvFile'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No CSV file uploaded' });
+    }
+
+    const filePath = req.file.path;
+
+    try {
+      // Parse the CSV file
+      const parseResult = await parseCSVFile(filePath);
+
+      if (parseResult.isbns.length === 0) {
+        return res.status(400).json({
+          error: 'No valid ISBNs found in the CSV file',
+          details: 'Please ensure your CSV contains a column with ISBN values',
+          detectedColumns: parseResult.detectedColumns
+        });
+      }
+
+      if (parseResult.isbns.length > 50) {
+        return res.status(400).json({
+          error: 'Too many ISBNs found',
+          details: `Found ${parseResult.isbns.length} ISBNs, but maximum allowed is 50`
+        });
+      }
+
+      // Process the ISBNs through the full workflow
+      const startTime = Date.now();
+      const results = {};
+      let scrapeSuccessful = 0;
+      let aiSuccessful = 0;
+      let csvSuccessful = 0;
+      let failed = 0;
+
+      // Process ISBNs sequentially to avoid overwhelming the server
+      for (const isbn of parseResult.isbns) {
+        console.log(`Processing ISBN from CSV: ${isbn}`);
+
+        const result = await processFullWorkflow(isbn);
+        results[isbn] = result;
+
+        // Update counters
+        if (result.scrapeSuccess) scrapeSuccessful++;
+        if (result.aiSuccess) aiSuccessful++;
+        if (result.csvSuccess) csvSuccessful++;
+        if (result.error) failed++;
+      }
+
+      const totalDuration = Date.now() - startTime;
+
+      const response = {
+        results,
+        summary: {
+          total: parseResult.isbns.length,
+          scrapeSuccessful,
+          aiSuccessful,
+          csvSuccessful,
+          failed,
+          totalDuration,
+          averageDuration: Math.round(totalDuration / parseResult.isbns.length)
+        },
+        csvFileInfo: {
+          filename: req.file.originalname,
+          detectedColumns: parseResult.detectedColumns,
+          isbnColumnDetected: parseResult.isbnColumnDetected,
+          totalIsbnsFound: parseResult.totalFound
+        }
+      };
+
+      res.json(response);
+
+    } catch (parseError) {
+      console.error('CSV parsing error:', parseError);
+      res.status(400).json({
+        error: 'Failed to parse CSV file',
+        details: parseError.message
+      });
+    } finally {
+      // Clean up uploaded file
+      try {
+        fs.unlinkSync(filePath);
+      } catch (cleanupError) {
+        console.error('Error cleaning up uploaded file:', cleanupError);
+      }
+    }
+
+  } catch (error) {
+    console.error('CSV upload workflow error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
 
 app.post('/api/openrouter', async (req, res) => {
   try {
@@ -176,15 +553,12 @@ app.post('/api/save-to-csv', async (req, res) => {
       return res.status(400).json({ error: 'ISBN and AI response are required' });
     }
 
-    // Generate hash for uniqueness check
-    const responseHash = generateResponseHash(isbn, aiResponse);
-
-    // Check if record already exists
-    const exists = await checkRecordExists(responseHash);
+    // Check if ISBN already exists in CSV
+    const exists = await checkIsbnExists(isbn);
     if (exists) {
       return res.json({
         success: true,
-        message: 'Record already exists in CSV',
+        message: 'Book with this ISBN already exists in CSV',
         duplicate: true
       });
     }
@@ -441,6 +815,77 @@ app.post('/api/scrape-libraccio', async (req, res) => {
 
   } catch (error) {
     console.error('Scraping endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+app.post('/api/full-workflow', async (req, res) => {
+  try {
+    const { isbn, isbns } = req.body;
+
+    // Determine input type and create ISBN array
+    let isbnArray = [];
+    if (isbn && typeof isbn === 'string') {
+      // Single ISBN
+      isbnArray = [isbn.trim()];
+    } else if (isbns && Array.isArray(isbns)) {
+      // Multiple ISBNs
+      isbnArray = isbns.map(i => i.trim()).filter(i => i.length > 0);
+    } else {
+      return res.status(400).json({ error: 'Either "isbn" (string) or "isbns" (array) is required' });
+    }
+
+    if (isbnArray.length === 0) {
+      return res.status(400).json({ error: 'At least one valid ISBN is required' });
+    }
+
+    if (isbnArray.length > 50) {
+      return res.status(400).json({ error: 'Maximum 50 ISBNs allowed per request' });
+    }
+
+    const startTime = Date.now();
+    const results = {};
+    let scrapeSuccessful = 0;
+    let aiSuccessful = 0;
+    let csvSuccessful = 0;
+    let failed = 0;
+
+    // Process ISBNs sequentially to avoid overwhelming the server
+    for (const isbnCode of isbnArray) {
+      console.log(`Processing ISBN: ${isbnCode}`);
+
+      const result = await processFullWorkflow(isbnCode);
+      results[isbnCode] = result;
+
+      // Update counters
+      if (result.scrapeSuccess) scrapeSuccessful++;
+      if (result.aiSuccess) aiSuccessful++;
+      if (result.csvSuccess) csvSuccessful++;
+      if (result.error) failed++;
+    }
+
+    const totalDuration = Date.now() - startTime;
+
+    const response = {
+      results,
+      summary: {
+        total: isbnArray.length,
+        scrapeSuccessful,
+        aiSuccessful,
+        csvSuccessful,
+        failed,
+        totalDuration,
+        averageDuration: Math.round(totalDuration / isbnArray.length)
+      }
+    };
+
+    res.json(response);
+
+  } catch (error) {
+    console.error('Full workflow endpoint error:', error);
     res.status(500).json({
       error: 'Internal server error',
       details: error.message
