@@ -11,6 +11,182 @@ const multer = require('multer');
 const csvParser = require('csv-parser');
 require('dotenv').config();
 
+// Chunking Manager Class
+class ChunkManager {
+  constructor() {
+    this.jobs = new Map(); // Store job progress and results
+    this.eventListeners = new Map(); // Store SSE connections
+  }
+
+  generateJobId() {
+    return 'job_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+  }
+
+  createJob(isbns, chunkSize = 50) {
+    const jobId = this.generateJobId();
+    const chunks = this.createChunks(isbns, chunkSize);
+
+    const job = {
+      id: jobId,
+      status: 'pending', // pending, processing, completed, failed, cancelled
+      isbns: isbns,
+      chunks: chunks,
+      currentChunk: 0,
+      totalChunks: chunks.length,
+      results: {},
+      summary: {
+        total: isbns.length,
+        processed: 0,
+        successful: 0,
+        scrapeSuccessful: 0,
+        aiSuccessful: 0,
+        csvSuccessful: 0,
+        failed: 0
+      },
+      startTime: Date.now(),
+      endTime: null,
+      error: null
+    };
+
+    this.jobs.set(jobId, job);
+    return job;
+  }
+
+  createChunks(isbns, chunkSize) {
+    const chunks = [];
+    for (let i = 0; i < isbns.length; i += chunkSize) {
+      chunks.push(isbns.slice(i, i + chunkSize));
+    }
+    return chunks;
+  }
+
+  getJob(jobId) {
+    return this.jobs.get(jobId);
+  }
+
+  updateJobProgress(jobId, chunkIndex, chunkResults) {
+    const job = this.jobs.get(jobId);
+    if (!job) return null;
+
+    // Update results
+    Object.assign(job.results, chunkResults);
+
+    // Update summary
+    Object.values(chunkResults).forEach(result => {
+      job.summary.processed++;
+      if (result.scrapeSuccess) job.summary.scrapeSuccessful++;
+      if (result.aiSuccess) job.summary.aiSuccessful++;
+      if (result.csvSuccess) job.summary.csvSuccessful++;
+      if (result.error) job.summary.failed++;
+    });
+
+    job.summary.successful = job.summary.scrapeSuccessful;
+    job.currentChunk = chunkIndex + 1;
+
+    // Send progress update via SSE
+    this.broadcastProgress(jobId);
+
+    return job;
+  }
+
+  completeJob(jobId) {
+    const job = this.jobs.get(jobId);
+    if (!job) return null;
+
+    job.status = 'completed';
+    job.endTime = Date.now();
+
+    // Send completion notification
+    this.broadcastProgress(jobId);
+
+    return job;
+  }
+
+  failJob(jobId, error) {
+    const job = this.jobs.get(jobId);
+    if (!job) return null;
+
+    job.status = 'failed';
+    job.error = error;
+    job.endTime = Date.now();
+
+    // Send failure notification
+    this.broadcastProgress(jobId);
+
+    return job;
+  }
+
+  addEventListener(jobId, res) {
+    if (!this.eventListeners.has(jobId)) {
+      this.eventListeners.set(jobId, []);
+    }
+    this.eventListeners.get(jobId).push(res);
+  }
+
+  removeEventListener(jobId, res) {
+    const listeners = this.eventListeners.get(jobId);
+    if (listeners) {
+      const index = listeners.indexOf(res);
+      if (index > -1) {
+        listeners.splice(index, 1);
+      }
+      if (listeners.length === 0) {
+        this.eventListeners.delete(jobId);
+      }
+    }
+  }
+
+  broadcastProgress(jobId) {
+    const job = this.jobs.get(jobId);
+    const listeners = this.eventListeners.get(jobId);
+
+    if (job && listeners) {
+      const progressData = {
+        jobId: job.id,
+        status: job.status,
+        currentChunk: job.currentChunk,
+        totalChunks: job.totalChunks,
+        summary: job.summary,
+        progress: Math.round((job.summary.processed / job.summary.total) * 100),
+        eta: this.calculateETA(job)
+      };
+
+      listeners.forEach(res => {
+        try {
+          res.write(`data: ${JSON.stringify(progressData)}\n\n`);
+        } catch (error) {
+          console.error('Error sending SSE data:', error);
+        }
+      });
+    }
+  }
+
+  calculateETA(job) {
+    if (job.summary.processed === 0) return null;
+
+    const elapsed = Date.now() - job.startTime;
+    const avgTimePerItem = elapsed / job.summary.processed;
+    const remaining = job.summary.total - job.summary.processed;
+
+    return Math.round(remaining * avgTimePerItem);
+  }
+
+  cleanupOldJobs() {
+    const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+    const now = Date.now();
+
+    for (const [jobId, job] of this.jobs.entries()) {
+      if (job.endTime && (now - job.endTime) > maxAge) {
+        this.jobs.delete(jobId);
+        this.eventListeners.delete(jobId);
+      }
+    }
+  }
+}
+
+// Global chunk manager instance
+const chunkManager = new ChunkManager();
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -281,10 +457,11 @@ Please provide a JSON response with the following book metadata:
         return result;
       }
 
+      console.log(1)
       const aiResponse = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
         {
-          model: 'google/gemini-flash-1.5-8b',
+          model: 'mistralai/ministral-3b',
           messages: [{
             role: 'user',
             content: structuredPrompt
@@ -423,10 +600,27 @@ app.post('/api/upload-csv-workflow', upload.single('csvFile'), async (req, res) 
 
       const totalDuration = Date.now() - startTime;
 
+      // Normalize the response for frontend compatibility
+      const normalizedResults = {};
+      for (const [isbn, result] of Object.entries(results)) {
+        normalizedResults[isbn] = {
+          ...result,
+          // Add 'found' property for frontend compatibility with regular batch scraping
+          found: result.scrapeSuccess,
+          // Keep original properties for enhanced CSV upload display
+          scrapeSuccess: result.scrapeSuccess,
+          aiSuccess: result.aiSuccess,
+          csvSuccess: result.csvSuccess,
+          bookData: result.bookData,
+          csvDuplicate: result.csvDuplicate
+        };
+      }
+
       const response = {
-        results,
+        results: normalizedResults,
         summary: {
           total: parseResult.isbns.length,
+          successful: scrapeSuccessful, // Add 'successful' for frontend compatibility
           scrapeSuccessful,
           aiSuccessful,
           csvSuccessful,
@@ -468,6 +662,195 @@ app.post('/api/upload-csv-workflow', upload.single('csvFile'), async (req, res) 
   }
 });
 
+// Chunked CSV Workflow - for files with >50 ISBNs
+app.post('/api/chunked-csv-workflow', upload.single('csvFile'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No CSV file uploaded' });
+    }
+
+    const filePath = req.file.path;
+
+    try {
+      // Parse the CSV file
+      const parseResult = await parseCSVFile(filePath);
+
+      if (parseResult.isbns.length === 0) {
+        return res.status(400).json({
+          error: 'No valid ISBNs found in the CSV file',
+          details: 'Please ensure your CSV contains a column with ISBN values',
+          detectedColumns: parseResult.detectedColumns
+        });
+      }
+
+      // Create chunked job
+      const job = chunkManager.createJob(parseResult.isbns);
+
+      // Return job ID immediately for client to start monitoring
+      res.json({
+        jobId: job.id,
+        status: 'created',
+        totalISBNs: parseResult.isbns.length,
+        totalChunks: job.totalChunks,
+        csvFileInfo: {
+          filename: req.file.originalname,
+          detectedColumns: parseResult.detectedColumns,
+          isbnColumnDetected: parseResult.isbnColumnDetected,
+          totalIsbnsFound: parseResult.totalFound
+        }
+      });
+
+      // Start processing chunks asynchronously
+      processChunkedJob(job.id);
+
+    } catch (parseError) {
+      console.error('CSV parsing error:', parseError);
+      res.status(400).json({
+        error: 'Failed to parse CSV file',
+        details: parseError.message
+      });
+    } finally {
+      // Clean up uploaded file
+      try {
+        fs.unlinkSync(filePath);
+      } catch (cleanupError) {
+        console.error('Error cleaning up uploaded file:', cleanupError);
+      }
+    }
+
+  } catch (error) {
+    console.error('Chunked CSV upload error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// Process chunked job asynchronously
+async function processChunkedJob(jobId) {
+  const job = chunkManager.getJob(jobId);
+  if (!job) return;
+
+  job.status = 'processing';
+  chunkManager.broadcastProgress(jobId);
+
+  try {
+    for (let chunkIndex = 0; chunkIndex < job.chunks.length; chunkIndex++) {
+      const chunk = job.chunks[chunkIndex];
+      console.log(`Processing chunk ${chunkIndex + 1}/${job.chunks.length} for job ${jobId}`);
+
+      const chunkResults = {};
+
+      // Process each ISBN in the chunk
+      for (const isbn of chunk) {
+        try {
+          const result = await processFullWorkflow(isbn);
+          chunkResults[isbn] = result;
+        } catch (error) {
+          console.error(`Error processing ISBN ${isbn}:`, error);
+          chunkResults[isbn] = {
+            isbn,
+            scrapeSuccess: false,
+            aiSuccess: false,
+            csvSuccess: false,
+            bookData: null,
+            csvDuplicate: false,
+            duration: 0,
+            error: error.message
+          };
+        }
+      }
+
+      // Update job progress
+      chunkManager.updateJobProgress(jobId, chunkIndex, chunkResults);
+
+      // Small delay between chunks to prevent overwhelming
+      if (chunkIndex < job.chunks.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    // Mark job as completed
+    chunkManager.completeJob(jobId);
+
+  } catch (error) {
+    console.error(`Error processing chunked job ${jobId}:`, error);
+    chunkManager.failJob(jobId, error.message);
+  }
+}
+
+// Server-Sent Events endpoint for progress tracking
+app.get('/api/job-progress/:jobId', (req, res) => {
+  const jobId = req.params.jobId;
+  const job = chunkManager.getJob(jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  // Set SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Cache-Control'
+  });
+
+  // Send initial job status
+  const initialData = {
+    jobId: job.id,
+    status: job.status,
+    currentChunk: job.currentChunk,
+    totalChunks: job.totalChunks,
+    summary: job.summary,
+    progress: Math.round((job.summary.processed / job.summary.total) * 100),
+    eta: chunkManager.calculateETA(job)
+  };
+
+  res.write(`data: ${JSON.stringify(initialData)}\n\n`);
+
+  // Add this connection to the job's listeners
+  chunkManager.addEventListener(jobId, res);
+
+  // Handle client disconnect
+  req.on('close', () => {
+    chunkManager.removeEventListener(jobId, res);
+  });
+
+  req.on('error', () => {
+    chunkManager.removeEventListener(jobId, res);
+  });
+});
+
+// Get job status endpoint (alternative to SSE)
+app.get('/api/job-status/:jobId', (req, res) => {
+  const jobId = req.params.jobId;
+  const job = chunkManager.getJob(jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  res.json({
+    jobId: job.id,
+    status: job.status,
+    currentChunk: job.currentChunk,
+    totalChunks: job.totalChunks,
+    summary: job.summary,
+    progress: Math.round((job.summary.processed / job.summary.total) * 100),
+    eta: chunkManager.calculateETA(job),
+    results: job.status === 'completed' ? job.results : null,
+    error: job.error
+  });
+});
+
+// Cleanup old jobs periodically
+setInterval(() => {
+  chunkManager.cleanupOldJobs();
+}, 60 * 60 * 1000); // Every hour
+
 app.post('/api/openrouter', async (req, res) => {
   try {
     const { prompt } = req.body;
@@ -481,10 +864,11 @@ app.post('/api/openrouter', async (req, res) => {
       return res.status(500).json({ error: 'OPENROUTER_API_KEY not configured' });
     }
 
+    console.log(2)
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: 'google/gemini-flash-1.5-8b',
+        model: 'mistralai/ministral-3b',
         messages: [{
           role: 'user',
           content: prompt
@@ -869,10 +1253,27 @@ app.post('/api/full-workflow', async (req, res) => {
 
     const totalDuration = Date.now() - startTime;
 
+    // Normalize the response for frontend compatibility
+    const normalizedResults = {};
+    for (const [isbn, result] of Object.entries(results)) {
+      normalizedResults[isbn] = {
+        ...result,
+        // Add 'found' property for frontend compatibility with regular batch scraping
+        found: result.scrapeSuccess,
+        // Keep original properties for enhanced full workflow display
+        scrapeSuccess: result.scrapeSuccess,
+        aiSuccess: result.aiSuccess,
+        csvSuccess: result.csvSuccess,
+        bookData: result.bookData,
+        csvDuplicate: result.csvDuplicate
+      };
+    }
+
     const response = {
-      results,
+      results: normalizedResults,
       summary: {
         total: isbnArray.length,
+        successful: scrapeSuccessful, // Add 'successful' for frontend compatibility
         scrapeSuccessful,
         aiSuccessful,
         csvSuccessful,
@@ -891,6 +1292,18 @@ app.post('/api/full-workflow', async (req, res) => {
       details: error.message
     });
   }
+});
+
+// Debug endpoint to test server
+app.get('/api/debug', (req, res) => {
+  res.json({
+    message: 'Server is working',
+    endpoints: [
+      'POST /api/chunked-csv-workflow',
+      'GET /api/job-progress/:jobId',
+      'GET /api/job-status/:jobId'
+    ]
+  });
 });
 
 app.listen(PORT, () => {

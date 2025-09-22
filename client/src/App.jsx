@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import './App.css'
 
 function App() {
@@ -36,6 +36,12 @@ function App() {
   const [csvUploading, setCsvUploading] = useState(false)
   const [csvUploadResult, setCsvUploadResult] = useState(null)
   const [dragActive, setDragActive] = useState(false)
+
+  // Chunked processing state
+  const [chunkJobId, setChunkJobId] = useState(null)
+  const [chunkProgress, setChunkProgress] = useState(null)
+  const [chunkProcessing, setChunkProcessing] = useState(false)
+  const [eventSource, setEventSource] = useState(null)
 
   // Toggle state for scrape result
   const [showScrapeResult, setShowScrapeResult] = useState(false)
@@ -259,6 +265,122 @@ function App() {
   const clearCsvFile = () => {
     setCsvFile(null)
     setCsvUploadResult(null)
+  }
+
+  // Cleanup event source on unmount
+  useEffect(() => {
+    return () => {
+      if (eventSource) {
+        eventSource.close()
+      }
+    }
+  }, [eventSource])
+
+  // Chunked CSV upload handler
+  const handleChunkedCsvUpload = async () => {
+    if (!csvFile) return
+
+    setChunkProcessing(true)
+    setChunkProgress(null)
+    setChunkJobId(null)
+    setCsvUploadResult(null)
+    setBatchResults({})
+    setBatchSummary(null)
+
+    // Start timer
+    const startTime = Date.now()
+    setProcessStartTime(startTime)
+    setProcessDuration(null)
+    setProcessType(`Chunked CSV Processing (${csvFile.name})`)
+
+    try {
+      const formData = new FormData()
+      formData.append('csvFile', csvFile)
+
+      const res = await fetch('http://localhost:3001/api/chunked-csv-workflow', {
+        method: 'POST',
+        body: formData
+      })
+
+      const data = await res.json()
+
+      if (res.ok) {
+        setChunkJobId(data.jobId)
+
+        // Set up Server-Sent Events for progress tracking
+        const es = new EventSource(`http://localhost:3001/api/job-progress/${data.jobId}`)
+        setEventSource(es)
+
+        es.onmessage = (event) => {
+          const progressData = JSON.parse(event.data)
+          setChunkProgress(progressData)
+
+          if (progressData.status === 'completed') {
+            // Job completed, fetch final results
+            fetch(`http://localhost:3001/api/job-status/${data.jobId}`)
+              .then(res => res.json())
+              .then(finalData => {
+                setBatchResults(finalData.results || {})
+                setBatchSummary(finalData.summary || {})
+                setCsvUploadResult({
+                  success: true,
+                  message: `Successfully processed ${finalData.summary?.total || 0} ISBNs using chunked processing`,
+                  csvFileInfo: data.csvFileInfo
+                })
+
+                // Calculate duration
+                const endTime = Date.now()
+                const duration = endTime - startTime
+                setProcessDuration(duration)
+
+                setChunkProcessing(false)
+                es.close()
+                setEventSource(null)
+              })
+              .catch(error => {
+                console.error('Error fetching final results:', error)
+                setChunkProcessing(false)
+                es.close()
+                setEventSource(null)
+              })
+          } else if (progressData.status === 'failed') {
+            setCsvUploadResult({
+              success: false,
+              message: `Chunked processing failed: ${progressData.error}`,
+              details: progressData.details
+            })
+            setChunkProcessing(false)
+            es.close()
+            setEventSource(null)
+          }
+        }
+
+        es.onerror = (error) => {
+          console.error('EventSource error:', error)
+          setCsvUploadResult({
+            success: false,
+            message: 'Failed to receive progress updates'
+          })
+          setChunkProcessing(false)
+          es.close()
+          setEventSource(null)
+        }
+
+      } else {
+        setCsvUploadResult({
+          success: false,
+          message: `Chunked upload failed: ${data.error}`,
+          details: data.details
+        })
+        setChunkProcessing(false)
+      }
+    } catch (error) {
+      setCsvUploadResult({
+        success: false,
+        message: `Chunked upload failed: ${error.message}`
+      })
+      setChunkProcessing(false)
+    }
   }
 
   const handleSubmit = async (e) => {
@@ -596,24 +718,115 @@ Please provide a JSON response with the following book metadata:
           />
 
           {csvFile && (
-            <button
-              onClick={handleCsvUpload}
-              disabled={csvUploading}
-              style={{
-                width: '100%',
-                padding: '12px',
-                fontSize: '16px',
-                fontWeight: 'bold',
-                backgroundColor: csvUploading ? '#6c757d' : '#007bff',
-                color: 'white',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: csvUploading ? 'not-allowed' : 'pointer',
-                marginBottom: '16px'
-              }}
-            >
-              {csvUploading ? 'Processing CSV...' : `🚀 Process CSV File`}
-            </button>
+            <div style={{ marginBottom: '16px' }}>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '12px' }}>
+                <button
+                  onClick={handleCsvUpload}
+                  disabled={csvUploading || chunkProcessing}
+                  style={{
+                    flex: 1,
+                    padding: '12px',
+                    fontSize: '14px',
+                    fontWeight: 'bold',
+                    backgroundColor: (csvUploading || chunkProcessing) ? '#6c757d' : '#007bff',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: (csvUploading || chunkProcessing) ? 'not-allowed' : 'pointer'
+                  }}
+                >
+                  {csvUploading ? 'Processing...' : `🚀 Process CSV (≤50 ISBNs)`}
+                </button>
+                <button
+                  onClick={handleChunkedCsvUpload}
+                  disabled={csvUploading || chunkProcessing}
+                  style={{
+                    flex: 1,
+                    padding: '12px',
+                    fontSize: '14px',
+                    fontWeight: 'bold',
+                    backgroundColor: (csvUploading || chunkProcessing) ? '#6c757d' : '#28a745',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: (csvUploading || chunkProcessing) ? 'not-allowed' : 'pointer'
+                  }}
+                >
+                  {chunkProcessing ? 'Processing...' : `⚡ Chunked Process (Unlimited)`}
+                </button>
+              </div>
+              <p style={{ fontSize: '12px', color: '#666', margin: '0', lineHeight: '1.4' }}>
+                <strong>Regular:</strong> Up to 50 ISBNs, all processed at once<br/>
+                <strong>Chunked:</strong> Unlimited ISBNs, processed in batches of 50 with progress tracking
+              </p>
+            </div>
+          )}
+
+          {/* Chunked Processing Progress UI */}
+          {chunkProgress && (
+            <div style={{
+              padding: '16px',
+              border: '1px solid #007bff',
+              borderRadius: '4px',
+              backgroundColor: '#f8f9fa',
+              marginBottom: '16px'
+            }}>
+              <h4 style={{ margin: '0 0 12px 0', color: '#007bff' }}>
+                📊 Processing Progress - Job {chunkJobId?.substring(0, 8)}...
+              </h4>
+
+              <div style={{ marginBottom: '12px' }}>
+                <div style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: '4px'
+                }}>
+                  <span style={{ fontSize: '14px', fontWeight: 'bold' }}>
+                    Chunks: {chunkProgress.chunksCompleted || 0} / {chunkProgress.totalChunks || 0}
+                  </span>
+                  <span style={{ fontSize: '14px', color: '#666' }}>
+                    {Math.round(chunkProgress.progressPercentage || 0)}%
+                  </span>
+                </div>
+                <div style={{
+                  width: '100%',
+                  height: '8px',
+                  backgroundColor: '#e9ecef',
+                  borderRadius: '4px',
+                  overflow: 'hidden'
+                }}>
+                  <div style={{
+                    width: `${chunkProgress.progressPercentage || 0}%`,
+                    height: '100%',
+                    backgroundColor: '#007bff',
+                    transition: 'width 0.3s ease'
+                  }} />
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: '16px', fontSize: '12px', color: '#666' }}>
+                <span>📚 Total ISBNs: {chunkProgress.totalItems || 0}</span>
+                <span>✅ Processed: {chunkProgress.processedItems || 0}</span>
+                <span>⏱️ Status: {chunkProgress.status}</span>
+                {chunkProgress.eta && (
+                  <span>🕒 ETA: {Math.round(chunkProgress.eta / 1000)}s</span>
+                )}
+              </div>
+
+              {chunkProgress.currentChunk && (
+                <div style={{
+                  marginTop: '8px',
+                  padding: '8px',
+                  backgroundColor: '#e3f2fd',
+                  borderRadius: '3px',
+                  fontSize: '12px'
+                }}>
+                  Current chunk: {chunkProgress.currentChunk.start + 1}-{chunkProgress.currentChunk.end}
+                  (ISBNs: {chunkProgress.currentChunk.isbns?.slice(0, 3).join(', ')}...)
+                </div>
+              )}
+            </div>
           )}
 
           {csvUploadResult && (
@@ -771,23 +984,35 @@ Please provide a JSON response with the following book metadata:
               <div className="summary-stats">
                 <div className="summary-stat success">
                   <span className="stat-label">Successful:</span>
-                  <span className="stat-value">{batchSummary.successful}</span>
+                  <span className="stat-value">{batchSummary.successful || batchSummary.scrapeSuccessful || 0}</span>
                 </div>
                 <div className="summary-stat failed">
                   <span className="stat-label">Failed:</span>
-                  <span className="stat-value">{batchSummary.failed}</span>
+                  <span className="stat-value">{batchSummary.failed || 0}</span>
                 </div>
                 <div className="summary-stat total">
                   <span className="stat-label">Total:</span>
-                  <span className="stat-value">{batchSummary.total}</span>
+                  <span className="stat-value">{batchSummary.total || 0}</span>
                 </div>
+                {batchSummary.aiSuccessful !== undefined && (
+                  <div className="summary-stat ai-success">
+                    <span className="stat-label">AI Processed:</span>
+                    <span className="stat-value">{batchSummary.aiSuccessful}</span>
+                  </div>
+                )}
+                {batchSummary.csvSuccessful !== undefined && (
+                  <div className="summary-stat csv-success">
+                    <span className="stat-label">CSV Saved:</span>
+                    <span className="stat-value">{batchSummary.csvSuccessful}</span>
+                  </div>
+                )}
                 <div className="summary-stat duration">
                   <span className="stat-label">Total Duration:</span>
-                  <span className="stat-value">{(batchSummary.totalDuration / 1000).toFixed(2)}s</span>
+                  <span className="stat-value">{((batchSummary.totalDuration || 0) / 1000).toFixed(2)}s</span>
                 </div>
                 <div className="summary-stat average">
                   <span className="stat-label">Avg per ISBN:</span>
-                  <span className="stat-value">{(batchSummary.averageDuration / 1000).toFixed(2)}s</span>
+                  <span className="stat-value">{((batchSummary.averageDuration || 0) / 1000).toFixed(2)}s</span>
                 </div>
               </div>
 
@@ -802,35 +1027,63 @@ Please provide a JSON response with the following book metadata:
             </div>
 
             <div className="batch-results-grid">
-              {Object.entries(batchResults).map(([isbn, result]) => (
-                <div key={isbn} className={`batch-result-item ${result.found ? 'success' : 'failed'}`}>
-                  <div className="result-header">
-                    <span className="result-isbn">{isbn}</span>
-                    <span className={`result-status ${result.found ? 'success' : 'failed'}`}>
-                      {result.found ? '✓ Found' : '✗ Failed'}
-                    </span>
-                  </div>
+              {Object.entries(batchResults).map(([isbn, result]) => {
+                // Normalize data structure - handle both regular batch scraping and CSV upload workflows
+                const isSuccess = result.found !== undefined ? result.found : result.scrapeSuccess;
+                const hasError = result.error;
+                const duration = result.duration || 0;
 
-                  <div className="result-details">
-                    <div className="result-timing">
-                      <span className="timing-label">Duration:</span>
-                      <span className="timing-value">{(result.duration / 1000).toFixed(2)}s</span>
+                return (
+                  <div key={isbn} className={`batch-result-item ${isSuccess ? 'success' : 'failed'}`}>
+                    <div className="result-header">
+                      <span className="result-isbn">{isbn}</span>
+                      <span className={`result-status ${isSuccess ? 'success' : 'failed'}`}>
+                        {isSuccess ? '✓ Success' : '✗ Failed'}
+                      </span>
                     </div>
 
-                    {result.found && (
-                      <div className="result-actions">
-                        <button
-                          className="view-details-btn"
-                          onClick={() => {
-                            if (!result.html) {
-                              // Fallback for when there's no HTML content
-                              const fallbackPrompt = `Please help analyze book information for ISBN: ${isbn}`;
-                              setPrompt(fallbackPrompt);
-                              return;
-                            }
+                    <div className="result-details">
+                      <div className="result-timing">
+                        <span className="timing-label">Duration:</span>
+                        <span className="timing-value">{(duration / 1000).toFixed(2)}s</span>
+                      </div>
 
-                            const parsedText = parseHtmlContent(result.html);
-                            const structuredPrompt = `Please analyze this book information from Libraccio and extract the metadata:
+                      {/* Show additional status for CSV upload workflow */}
+                      {result.aiSuccess !== undefined && (
+                        <div className="result-status-details">
+                          <span className={`status-indicator ${result.aiSuccess ? 'success' : 'failed'}`}>
+                            AI: {result.aiSuccess ? '✓' : '✗'}
+                          </span>
+                          <span className={`status-indicator ${result.csvSuccess ? 'success' : 'failed'}`}>
+                            CSV: {result.csvSuccess ? '✓' : (result.csvDuplicate ? '⚠' : '✗')}
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Show book data if available from CSV upload workflow */}
+                      {result.bookData && (
+                        <div className="result-book-data">
+                          <div className="book-info">
+                            <strong>{result.bookData.title}</strong>
+                            {result.bookData.author && <div>by {result.bookData.author}</div>}
+                          </div>
+                        </div>
+                      )}
+
+                      {isSuccess && (
+                        <div className="result-actions">
+                          <button
+                            className="view-details-btn"
+                            onClick={() => {
+                              if (result.bookData) {
+                                // For CSV upload workflow, use existing book data
+                                const bookDataStr = JSON.stringify(result.bookData, null, 2);
+                                const structuredPrompt = `Book data already extracted for ISBN ${isbn}:\n\n${bookDataStr}\n\nYou can modify or enhance this data if needed.`;
+                                setPrompt(structuredPrompt);
+                              } else if (result.html) {
+                                // For regular batch scraping workflow, parse HTML
+                                const parsedText = parseHtmlContent(result.html);
+                                const structuredPrompt = `Please analyze this book information from Libraccio and extract the metadata:
 
 ${parsedText}
 
@@ -843,23 +1096,29 @@ Please provide a JSON response with the following book metadata:
 - isbn
 - description
 `;
-                            setPrompt(structuredPrompt);
-                          }}
-                        >
-                          Load to AI Prompt
-                        </button>
-                      </div>
-                    )}
+                                setPrompt(structuredPrompt);
+                              } else {
+                                // Fallback for when there's no HTML content or book data
+                                const fallbackPrompt = `Please help analyze book information for ISBN: ${isbn}`;
+                                setPrompt(fallbackPrompt);
+                              }
+                            }}
+                          >
+                            Load to AI Prompt
+                          </button>
+                        </div>
+                      )}
 
-                    {result.error && (
-                      <div className="result-error">
-                        <span className="error-label">Error:</span>
-                        <span className="error-message">{result.error}</span>
-                      </div>
-                    )}
+                      {hasError && (
+                        <div className="result-error">
+                          <span className="error-label">Error:</span>
+                          <span className="error-message">{result.error}</span>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
