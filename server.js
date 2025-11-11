@@ -190,14 +190,19 @@ const chunkManager = new ChunkManager();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-app.use(cors());
+// Configure CORS to allow all origins and handle preflight requests
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 // Multer configuration for file uploads
 const upload = multer({
   dest: 'uploads/',
   limits: {
-    fileSize: 1024 * 1024 // 1MB limit
+    fileSize: 10 * 1024 * 1024 // 10MB limit
   },
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {
@@ -430,13 +435,33 @@ const processFullWorkflow = async (isbn) => {
       return result;
     }
 
-    // Step 3: Parse HTML content
-    const parsedText = parseHtmlContent(scrapeResult.data.html);
+    // Step 3: Use Jina AI Reader for clean, optimized content extraction
+    let cleanedContent = '';
+    try {
+      const libraccioUrl = `https://www.libraccio.it/libro/${isbn}`;
+      const jinaUrl = `https://r.jina.ai/${libraccioUrl}`;
 
-    // Step 4: Create structured prompt for AI
+      console.log(`Fetching cleaned content from Jina Reader: ${jinaUrl}`);
+      const jinaResponse = await axios.get(jinaUrl, {
+        headers: {
+          'Accept': 'text/plain',
+          'X-With-Generated-Alt': 'true'
+        },
+        timeout: 10000
+      });
+
+      cleanedContent = jinaResponse.data;
+      console.log(`Jina Reader success - Content length: ${cleanedContent.length} chars`);
+    } catch (jinaError) {
+      console.log('Jina Reader failed, falling back to HTML parsing:', jinaError.message);
+      // Fallback to original HTML parsing if Jina fails
+      cleanedContent = parseHtmlContent(scrapeResult.data.html);
+    }
+
+    // Step 4: Create structured prompt for AI (using cleaned content)
     const structuredPrompt = `Please analyze this book information from Libraccio and extract the metadata:
 
-${parsedText}
+${cleanedContent.substring(0, 8000)}
 
 Please provide a JSON response with the following book metadata:
 - title
@@ -465,7 +490,8 @@ Please provide a JSON response with the following book metadata:
           messages: [{
             role: 'user',
             content: structuredPrompt
-          }]
+          }],
+          max_tokens: 1500  // Limit response tokens to prevent excessive usage
         },
         {
           headers: {
@@ -872,7 +898,8 @@ app.post('/api/openrouter', async (req, res) => {
         messages: [{
           role: 'user',
           content: prompt
-        }]
+        }],
+        max_tokens: 1500  // Limit response tokens to prevent excessive usage
       },
       {
         headers: {
