@@ -9,6 +9,7 @@ const createCsvWriter = require('csv-writer').createObjectCsvWriter;
 const { JSDOM } = require('jsdom');
 const multer = require('multer');
 const csvParser = require('csv-parser');
+const { SUPPORTED_SITES, DEFAULT_SITE, getSite, getAllSites } = require('./sites-config');
 require('dotenv').config();
 
 // Chunking Manager Class
@@ -402,8 +403,186 @@ function parseCSVFile(filePath) {
   });
 }
 
+// Universal scraper using Jina AI Reader
+const scrapeWithJina = async (isbn, site) => {
+  const startTime = Date.now();
+
+  try {
+    const bookUrl = site.urlPattern.replace('{isbn}', isbn);
+    const jinaUrl = `https://r.jina.ai/${bookUrl}`;
+
+    console.log(`[Jina Scraper] Fetching from ${site.name}: ${jinaUrl}`);
+
+    const response = await axios.get(jinaUrl, {
+      headers: {
+        'Accept': 'text/plain',
+        'X-With-Generated-Alt': 'true'
+      },
+      timeout: 15000
+    });
+
+    const cleanedContent = response.data;
+    console.log(`[Jina Scraper] Success - Content length: ${cleanedContent.length} chars from ${site.name}`);
+
+    return {
+      isbn,
+      success: true,
+      data: {
+        found: true,
+        html: cleanedContent,
+        text: cleanedContent,
+        source: site.name,
+        siteId: site.id
+      },
+      duration: Date.now() - startTime
+    };
+  } catch (error) {
+    console.error(`[Jina Scraper] Error scraping ${site.name}:`, error.message);
+    return {
+      isbn,
+      success: false,
+      error: `Failed to scrape from ${site.name}: ${error.message}`,
+      duration: Date.now() - startTime
+    };
+  }
+};
+
+// Decitre.fr scraper - parses specific HTML class
+const scrapeWithDecitre = async (isbn, site) => {
+  const startTime = Date.now();
+
+  try {
+    const bookUrl = site.urlPattern.replace('{isbn}', isbn);
+    console.log(`[Decitre Scraper] Fetching from ${site.name}: ${bookUrl}`);
+
+    const response = await axios.get(bookUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7'
+      },
+      timeout: 15000
+    });
+
+    // Parse HTML with JSDOM
+    const dom = new JSDOM(response.data);
+    const document = dom.window.document;
+
+    // Extract description from the specific class
+    const synopsysElement = document.querySelector('.product-summary-synopsys');
+    let description = '';
+
+    if (synopsysElement) {
+      description = synopsysElement.textContent.trim();
+      console.log(`[Decitre Scraper] Success - Found description: ${description.length} chars from ${site.name}`);
+    } else {
+      console.log(`[Decitre Scraper] Warning - No element with class 'product-summary-synopsys' found`);
+    }
+
+    // Extract additional book information if needed
+    const titleElement = document.querySelector('h1');
+    const title = titleElement ? titleElement.textContent.trim() : '';
+
+    // Create a structured text output similar to Jina format
+    const cleanedContent = `Title: ${title}\n\nDescription: ${description}`;
+
+    return {
+      isbn,
+      success: true,
+      data: {
+        found: !!synopsysElement,
+        html: cleanedContent,
+        text: cleanedContent,
+        description: description,
+        source: site.name,
+        siteId: site.id
+      },
+      duration: Date.now() - startTime
+    };
+  } catch (error) {
+    console.error(`[Decitre Scraper] Error scraping ${site.name}:`, error.message);
+    return {
+      isbn,
+      success: false,
+      error: `Failed to scrape from ${site.name}: ${error.message}`,
+      duration: Date.now() - startTime
+    };
+  }
+};
+
+// Helper function to scrape a single ISBN from Python scraper
+const scrapeWithPython = async (isbn, site) => {
+  return new Promise((resolve) => {
+    const startTime = Date.now();
+    const scraperPath = path.join(__dirname, 'libraccio_scraper_real.py');
+
+    const pythonProcess = spawn('python3', [scraperPath, isbn, '--headless'], {
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    pythonProcess.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    pythonProcess.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    const timeout = setTimeout(() => {
+      pythonProcess.kill();
+      resolve({
+        isbn,
+        success: false,
+        error: 'Timeout - request took too long',
+        duration: Date.now() - startTime
+      });
+    }, 15000);
+
+    pythonProcess.on('close', (code) => {
+      clearTimeout(timeout);
+      const duration = Date.now() - startTime;
+
+      if (code !== 0) {
+        resolve({
+          isbn,
+          success: false,
+          error: stderr || 'Unknown error occurred',
+          duration
+        });
+        return;
+      }
+
+      try {
+        const result = JSON.parse(stdout);
+        const filteredResult = {
+          found: result.found,
+          html: result.html,
+          source: site.name,
+          siteId: site.id
+        };
+        resolve({
+          isbn,
+          success: true,
+          data: filteredResult,
+          duration
+        });
+      } catch (parseError) {
+        resolve({
+          isbn,
+          success: false,
+          error: 'Failed to parse scraper response',
+          duration
+        });
+      }
+    });
+  });
+};
+
 // Helper function to process full workflow for a single ISBN
-const processFullWorkflow = async (isbn) => {
+const processFullWorkflow = async (isbn, siteId = DEFAULT_SITE) => {
   const startTime = Date.now();
   const result = {
     isbn,
@@ -417,8 +596,22 @@ const processFullWorkflow = async (isbn) => {
   };
 
   try {
-    // Step 1: Scrape the ISBN
-    const scrapeResult = await scrapeSingleISBN(isbn);
+    // Step 1: Get site configuration and scrape the ISBN
+    const site = getSite(siteId);
+    console.log(`[Workflow] Starting scrape for ISBN ${isbn} from ${site.name}`);
+
+    let scrapeResult;
+    if (site.scraper === 'jina') {
+      scrapeResult = await scrapeWithJina(isbn, site);
+    } else if (site.scraper === 'python') {
+      scrapeResult = await scrapeWithPython(isbn, site);
+    } else if (site.scraper === 'decitre') {
+      scrapeResult = await scrapeWithDecitre(isbn, site);
+    } else {
+      result.error = `Unknown scraper type: ${site.scraper}`;
+      result.duration = Date.now() - startTime;
+      return result;
+    }
 
     if (!scrapeResult.success) {
       result.error = scrapeResult.error;
@@ -427,34 +620,22 @@ const processFullWorkflow = async (isbn) => {
     }
 
     result.scrapeSuccess = true;
+    result.source = scrapeResult.data.source; // Store source site
 
-    // Step 2: Check if we have HTML content to process
+    // Step 2: Check if we have content to process
     if (!scrapeResult.data.found || !scrapeResult.data.html) {
-      result.error = 'No HTML content found for this ISBN';
+      result.error = 'No content found for this ISBN';
       result.duration = Date.now() - startTime;
       return result;
     }
 
-    // Step 3: Use Jina AI Reader for clean, optimized content extraction
+    // Step 3: Extract cleaned content (already cleaned by Jina, Decitre, or Python scraper)
     let cleanedContent = '';
-    try {
-      const libraccioUrl = `https://www.libraccio.it/libro/${isbn}`;
-      const jinaUrl = `https://r.jina.ai/${libraccioUrl}`;
-
-      console.log(`Fetching cleaned content from Jina Reader: ${jinaUrl}`);
-      const jinaResponse = await axios.get(jinaUrl, {
-        headers: {
-          'Accept': 'text/plain',
-          'X-With-Generated-Alt': 'true'
-        },
-        timeout: 10000
-      });
-
-      cleanedContent = jinaResponse.data;
-      console.log(`Jina Reader success - Content length: ${cleanedContent.length} chars`);
-    } catch (jinaError) {
-      console.log('Jina Reader failed, falling back to HTML parsing:', jinaError.message);
-      // Fallback to original HTML parsing if Jina fails
+    if (site.scraper === 'jina' || site.scraper === 'decitre') {
+      // Jina and Decitre already provide cleaned content
+      cleanedContent = scrapeResult.data.html;
+    } else {
+      // For Python scraper, parse HTML to extract text
       cleanedContent = parseHtmlContent(scrapeResult.data.html);
     }
 
@@ -1032,79 +1213,30 @@ app.get('/api/download-csv', (req, res) => {
   }
 });
 
-// Helper function to scrape a single ISBN
-const scrapeSingleISBN = async (isbn) => {
-  return new Promise((resolve) => {
-    const startTime = Date.now();
-    // Use the real scraper for actual data
-    const scraperPath = path.join(__dirname, 'libraccio_scraper_real.py');
+// Helper function to scrape a single ISBN (with site support)
+const scrapeSingleISBN = async (isbn, siteId = DEFAULT_SITE) => {
+  const site = getSite(siteId);
 
-    const pythonProcess = spawn('python3', [scraperPath, isbn, '--headless'], {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    pythonProcess.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-
-    const timeout = setTimeout(() => {
-      pythonProcess.kill();
-      resolve({
-        isbn,
-        success: false,
-        error: 'Timeout - request took too long',
-        duration: Date.now() - startTime
-      });
-    }, 15000);
-
-    pythonProcess.on('close', (code) => {
-      clearTimeout(timeout);
-      const duration = Date.now() - startTime;
-
-      if (code !== 0) {
-        resolve({
-          isbn,
-          success: false,
-          error: stderr || 'Unknown error occurred',
-          duration
-        });
-        return;
-      }
-
-      try {
-        const result = JSON.parse(stdout);
-        const filteredResult = {
-          found: result.found,
-          html: result.html
-        };
-        resolve({
-          isbn,
-          success: true,
-          data: filteredResult,
-          duration
-        });
-      } catch (parseError) {
-        resolve({
-          isbn,
-          success: false,
-          error: 'Failed to parse scraper response',
-          duration
-        });
-      }
-    });
-  });
+  if (site.scraper === 'jina') {
+    return await scrapeWithJina(isbn, site);
+  } else if (site.scraper === 'python') {
+    return await scrapeWithPython(isbn, site);
+  } else if (site.scraper === 'decitre') {
+    return await scrapeWithDecitre(isbn, site);
+  } else {
+    return {
+      isbn,
+      success: false,
+      error: `Unknown scraper type: ${site.scraper}`,
+      duration: 0
+    };
+  }
 };
 
 app.post('/api/scrape-libraccio-batch', async (req, res) => {
   try {
-    const { isbns } = req.body;
+    const { isbns, site } = req.body;
+    const siteId = site || DEFAULT_SITE;
 
     if (!isbns || !Array.isArray(isbns) || isbns.length === 0) {
       return res.status(400).json({ error: 'ISBNs array is required' });
@@ -1121,7 +1253,7 @@ app.post('/api/scrape-libraccio-batch', async (req, res) => {
 
     // Process ISBNs sequentially to avoid overwhelming the server
     for (const isbn of isbns) {
-      const result = await scrapeSingleISBN(isbn.trim());
+      const result = await scrapeSingleISBN(isbn.trim(), siteId);
 
       if (result.success) {
         results[result.isbn] = {
@@ -1163,66 +1295,28 @@ app.post('/api/scrape-libraccio-batch', async (req, res) => {
 
 app.post('/api/scrape-libraccio', async (req, res) => {
   try {
-    const { isbn } = req.body;
+    const { isbn, site } = req.body;
+    const siteId = site || DEFAULT_SITE;
 
     if (!isbn) {
       return res.status(400).json({ error: 'ISBN is required' });
     }
 
-    const scraperPath = path.join(__dirname, 'libraccio_scraper_real.py');
+    const result = await scrapeSingleISBN(isbn, siteId);
 
-    const pythonProcess = spawn('python3', [scraperPath, isbn, '--headless'], {
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    pythonProcess.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-
-    let responsesSent = false;
-
-    pythonProcess.on('close', (code) => {
-      if (responsesSent) return;
-      responsesSent = true;
-
-      if (code !== 0) {
-        console.error('Python script error:', stderr);
-        return res.status(500).json({
-          error: 'Scraping failed',
-          details: stderr || 'Unknown error occurred'
-        });
-      }
-
-      try {
-        const result = JSON.parse(stdout);
-        const filteredResult = {
-          found: result.found,
-          html: result.html
-        };
-        res.json(filteredResult);
-      } catch (parseError) {
-        console.error('JSON parse error:', parseError, 'Raw output:', stdout);
-        res.status(500).json({
-          error: 'Failed to parse scraper response',
-          details: parseError.message,
-          rawOutput: stdout
-        });
-      }
-    });
-
-    const timeout = setTimeout(() => {
-      if (responsesSent) return;
-      responsesSent = true;
-      pythonProcess.kill();
-      res.status(408).json({ error: 'Scraping timeout - request took too long' });
-    }, 15000);
+    if (result.success) {
+      res.json({
+        found: result.data.found,
+        html: result.data.html,
+        source: result.data.source,
+        siteId: result.data.siteId
+      });
+    } else {
+      res.status(500).json({
+        error: 'Scraping failed',
+        details: result.error
+      });
+    }
 
   } catch (error) {
     console.error('Scraping endpoint error:', error);
@@ -1235,7 +1329,8 @@ app.post('/api/scrape-libraccio', async (req, res) => {
 
 app.post('/api/full-workflow', async (req, res) => {
   try {
-    const { isbn, isbns } = req.body;
+    const { isbn, isbns, site } = req.body;
+    const siteId = site || DEFAULT_SITE;
 
     // Determine input type and create ISBN array
     let isbnArray = [];
@@ -1266,9 +1361,9 @@ app.post('/api/full-workflow', async (req, res) => {
 
     // Process ISBNs sequentially to avoid overwhelming the server
     for (const isbnCode of isbnArray) {
-      console.log(`Processing ISBN: ${isbnCode}`);
+      console.log(`Processing ISBN: ${isbnCode} from site: ${siteId}`);
 
-      const result = await processFullWorkflow(isbnCode);
+      const result = await processFullWorkflow(isbnCode, siteId);
       results[isbnCode] = result;
 
       // Update counters
@@ -1321,11 +1416,28 @@ app.post('/api/full-workflow', async (req, res) => {
   }
 });
 
+// Get available sites endpoint
+app.get('/api/sites', (req, res) => {
+  try {
+    res.json({
+      sites: getAllSites(),
+      default: DEFAULT_SITE
+    });
+  } catch (error) {
+    console.error('Error fetching sites:', error);
+    res.status(500).json({ error: 'Failed to fetch sites' });
+  }
+});
+
 // Debug endpoint to test server
 app.get('/api/debug', (req, res) => {
   res.json({
     message: 'Server is working',
     endpoints: [
+      'GET /api/sites',
+      'POST /api/scrape-libraccio',
+      'POST /api/scrape-libraccio-batch',
+      'POST /api/full-workflow',
       'POST /api/chunked-csv-workflow',
       'GET /api/job-progress/:jobId',
       'GET /api/job-status/:jobId'

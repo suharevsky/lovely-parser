@@ -52,6 +52,21 @@ function App() {
   // Toggle state for documentation
   const [showDocumentation, setShowDocumentation] = useState(false)
 
+  // Site selection state
+  const [selectedSite, setSelectedSite] = useState('libraccio')
+  const [availableSites, setAvailableSites] = useState([])
+
+  // Fetch available sites on mount
+  useEffect(() => {
+    fetch('http://localhost:3001/api/sites')
+      .then(res => res.json())
+      .then(data => {
+        setAvailableSites(data.sites)
+        setSelectedSite(data.default)
+      })
+      .catch(error => console.error('Error fetching sites:', error))
+  }, [])
+
   // Function to parse multiple ISBNs from input text
   const parseISBNs = (inputText) => {
     if (!inputText.trim()) return [];
@@ -446,7 +461,10 @@ function App() {
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ isbns: isbnArray }),
+          body: JSON.stringify({
+            isbns: isbnArray,
+            site: selectedSite
+          }),
         })
 
         const data = await res.json()
@@ -474,7 +492,10 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ isbn: isbnArray[0] || isbn.trim() }),
+        body: JSON.stringify({
+          isbn: isbnArray[0] || isbn.trim(),
+          site: selectedSite
+        }),
       })
 
       const data = await res.json()
@@ -488,17 +509,11 @@ function App() {
           const parsedText = parseHtmlContent(data.html)
 
           // Create a structured prompt for the AI
-          const structuredPrompt = `Please analyze this book information from Libraccio and extract the metadata:
+          const structuredPrompt = `
 
 ${parsedText}
 
 Please provide a JSON response with the following book metadata:
-- title
-- author
-- publisher
-- pages
-- edition_year
-- isbn
 - description
 `
 
@@ -613,6 +628,26 @@ Please provide a JSON response with the following book metadata:
               rows={4}
               disabled={scrapeLoading || batchProcessing}
             />
+          </div>
+
+          <div className="input-group">
+            <label htmlFor="site-selector">Select Book Store:</label>
+            <div className="site-selector-grid">
+              {availableSites.map(site => (
+                <button
+                  key={site.id}
+                  type="button"
+                  className={`site-option ${selectedSite === site.id ? 'selected' : ''}`}
+                  onClick={() => setSelectedSite(site.id)}
+                  disabled={scrapeLoading || batchProcessing}
+                  title={site.description}
+                >
+                  <span className="site-icon">{site.icon}</span>
+                  <span className="site-name">{site.name}</span>
+                  <span className="site-country">{site.country}</span>
+                </button>
+              ))}
+            </div>
           </div>
 
           <div className="input-group" style={{ display: 'none' }}>
@@ -1083,17 +1118,11 @@ Please provide a JSON response with the following book metadata:
                               } else if (result.html) {
                                 // For regular batch scraping workflow, parse HTML
                                 const parsedText = parseHtmlContent(result.html);
-                                const structuredPrompt = `Please analyze this book information from Libraccio and extract the metadata:
+                                const structuredPrompt = `
 
 ${parsedText}
 
 Please provide a JSON response with the following book metadata:
-- title
-- author
-- publisher
-- pages
-- edition_year
-- isbn
 - description
 `;
                                 setPrompt(structuredPrompt);
